@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const { google } = require('googleapis');
 
 const app = express();
+
 app.use(helmet());
 app.use(express.json({ limit: '10kb' }));
 
@@ -23,65 +24,44 @@ function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('hex');
 }
 
-function htmlPage(title, message) {
-  const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  })[c]);
+function page(title, message) {
+  const escapeHtml = (value) =>
+    String(value).replace(/[&<>"']/g, (char) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    })[char]);
 
   return `<!doctype html>
 <html lang="th">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(title)}</title>
 <style>
 body{font-family:Arial,sans-serif;background:#111827;color:#f9fafb;
-display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}
+display:grid;place-items:center;min-height:100vh;margin:0;padding:20px}
 main{max-width:520px;background:#1f2937;padding:28px;border-radius:16px}
-h1{font-size:24px}p{line-height:1.7;color:#d1d5db}
+p{line-height:1.8;color:#d1d5db}
 </style>
 </head>
-<body><main><h1>${escapeHtml(title)}</h1>
-<p>${escapeHtml(message)}</p></main></body></html>`;
+<body><main><h2>${escapeHtml(title)}</h2>
+<p>${escapeHtml(message)}</p></main></body>
+</html>`;
 }
 
-function checkConfig() {
-  const missing = [];
-  if (!BASE_URL) missing.push('BASE_URL');
-  if (!DISCORD_CLIENT_ID) missing.push('DISCORD_CLIENT_ID');
-  if (!DISCORD_CLIENT_SECRET) missing.push('DISCORD_CLIENT_SECRET');
-  if (!GOOGLE_SHEET_ID) missing.push('GOOGLE_SHEET_ID');
-  if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-    missing.push('GOOGLE_SERVICE_ACCOUNT_JSON');
-  }
-  return missing;
-}
+function missingConfig() {
+  const required = [
+    'BASE_URL',
+    'DISCORD_CLIENT_ID',
+    'DISCORD_CLIENT_SECRET',
+    'GOOGLE_SHEET_ID',
+    'GOOGLE_SERVICE_ACCOUNT_JSON'
+  ];
 
-function getRetryAfterSeconds(response, body) {
-  // Discord ปกติส่ง Retry-After เป็นจำนวนวินาที
-  const header = response.headers.get('retry-after');
-  if (header !== null && header.trim() !== '') {
-    const n = Number(header);
-    if (Number.isFinite(n) && n >= 0) return n;
-
-    // รองรับกรณี header เป็น HTTP-date
-    const dateMs = Date.parse(header);
-    if (Number.isFinite(dateMs)) {
-      return Math.max(0, (dateMs - Date.now()) / 1000);
-    }
-  }
-
-  const bodyValue = Number(body?.retry_after);
-  if (body?.retry_after !== undefined &&
-      Number.isFinite(bodyValue) && bodyValue >= 0) {
-    return bodyValue;
-  }
-
-  return null;
+  return required.filter((key) => !process.env[key]);
 }
 
 function cleanExpiredData() {
@@ -93,41 +73,25 @@ function cleanExpiredData() {
     }
   }
 
-  for (const [state, item] of oauthStates) {
-    if (item.expiresAt <= now) {
+  for (const [state, entry] of oauthStates) {
+    if (entry.expiresAt <= now) {
       oauthStates.delete(state);
     }
   }
 }
 
-function createSession() {
-  const id = randomToken(24);
-  const secret = randomToken(32);
-  const state = randomToken(32);
-  const now = Date.now();
-
-  sessions.set(id, {
-    id,
-    secretHash: crypto.createHash('sha256').update(secret).digest('hex'),
-    status: 'pending',
-    createdAt: now,
-    expiresAt: now + SESSION_TTL_MS,
-    completedAt: null,
-    discordUserId: null,
-    errorCode: null
-  });
-
-  oauthStates.set(state, {
-    sessionId: id,
-    expiresAt: now + SESSION_TTL_MS
-  });
-
-  return { id, secret, state };
+function hashSecret(secret) {
+  return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
 function safeEqualHex(a, b) {
-  if (typeof a !== 'string' || typeof b !== 'string') return false;
-  if (!/^[a-f0-9]+$/i.test(a) || !/^[a-f0-9]+$/i.test(b)) return false;
+  if (typeof a !== 'string' || typeof b !== 'string') {
+    return false;
+  }
+
+  if (!/^[a-f0-9]+$/i.test(a) || !/^[a-f0-9]+$/i.test(b)) {
+    return false;
+  }
 
   const left = Buffer.from(a, 'hex');
   const right = Buffer.from(b, 'hex');
@@ -137,36 +101,73 @@ function safeEqualHex(a, b) {
     crypto.timingSafeEqual(left, right);
 }
 
-async function isDiscordUserWhitelisted(discordUserId) {
+function getRetryAfterSeconds(response, body) {
+  const header = response.headers.get('retry-after');
+
+  if (header !== null && header.trim() !== '') {
+    const seconds = Number(header);
+
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return seconds;
+    }
+
+    const dateMs = Date.parse(header);
+
+    if (Number.isFinite(dateMs)) {
+      return Math.max(0, (dateMs - Date.now()) / 1000);
+    }
+  }
+
+  if (body && body.retry_after !== undefined) {
+    const seconds = Number(body.retry_after);
+
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return seconds;
+    }
+  }
+
+  return null;
+}
+
+async function isWhitelisted(discordUserId) {
   let credentials;
 
   try {
-    credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    credentials = JSON.parse(
+      process.env.GOOGLE_SERVICE_ACCOUNT_JSON
+    );
   } catch {
-    throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON');
+    throw new Error('Google service account JSON is invalid');
   }
 
   const auth = new google.auth.GoogleAuth({
     credentials,
-    scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly']
+    scopes: [
+      'https://www.googleapis.com/auth/spreadsheets.readonly'
+    ]
   });
 
-  const sheets = google.sheets({ version: 'v4', auth });
+  const sheets = google.sheets({
+    version: 'v4',
+    auth
+  });
+
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
     range: SHEET_RANGE
   });
 
   const rows = result.data.values || [];
+
   return rows.some((row) =>
     String(row?.[0] ?? '').trim() === String(discordUserId).trim()
   );
 }
 
 app.get('/health', (_req, res) => {
-  const missing = checkConfig();
+  const missing = missingConfig();
 
-  res.status(missing.length ? 503 : 200).json({
+  return res.status(missing.length ? 503 : 200).json({
     ok: missing.length === 0,
     service: 'hshonad-backend',
     missing
@@ -176,24 +177,39 @@ app.get('/health', (_req, res) => {
 app.post('/api/launcher/device-sessions', (_req, res) => {
   cleanExpiredData();
 
-  const missing = checkConfig();
-  if (missing.length) {
+  const missing = missingConfig();
+
+  if (missing.length > 0) {
     return res.status(503).json({
       error: 'server_not_configured',
-      message: 'Backend ยังตั้งค่าไม่ครบ',
       missing
     });
   }
 
-  const { id, secret, state } = createSession();
+  const id = randomToken(24);
+  const secret = randomToken(32);
+  const state = randomToken(32);
+  const expiresAt = Date.now() + SESSION_TTL_MS;
 
-  const verificationUrl =
-    `${BASE_URL}/auth/discord?state=${encodeURIComponent(state)}`;
+  sessions.set(id, {
+    id,
+    secretHash: hashSecret(secret),
+    status: 'pending',
+    expiresAt,
+    completedAt: null,
+    discordUserId: null
+  });
+
+  oauthStates.set(state, {
+    sessionId: id,
+    expiresAt
+  });
 
   return res.status(201).json({
     device_session_id: id,
     device_secret: secret,
-    verification_url: verificationUrl,
+    verification_url:
+      `${BASE_URL}/auth/discord?state=${encodeURIComponent(state)}`,
     expires_in: Math.floor(SESSION_TTL_MS / 1000)
   });
 });
@@ -202,20 +218,19 @@ app.get('/auth/discord', (req, res) => {
   cleanExpiredData();
 
   const state = String(req.query.state || '');
-  const stateItem = oauthStates.get(state);
+  const entry = oauthStates.get(state);
 
-  if (!stateItem || stateItem.expiresAt <= Date.now()) {
-    return res.status(400).send(htmlPage(
+  if (!entry || entry.expiresAt <= Date.now()) {
+    return res.status(400).send(page(
       'ลิงก์หมดอายุ',
       'กลับไปที่ Launcher แล้วเริ่ม Login ใหม่'
     ));
   }
 
-  const redirectUri = `${BASE_URL}/auth/discord/callback`;
   const params = new URLSearchParams({
     client_id: DISCORD_CLIENT_ID,
     response_type: 'code',
-    redirect_uri: redirectUri,
+    redirect_uri: `${BASE_URL}/auth/discord/callback`,
     scope: 'identify',
     state
   });
@@ -229,28 +244,29 @@ app.get('/auth/discord/callback', async (req, res) => {
   cleanExpiredData();
 
   const state = String(req.query.state || '');
-  const stateItem = oauthStates.get(state);
+  const entry = oauthStates.get(state);
 
-  if (!stateItem || stateItem.expiresAt <= Date.now()) {
-    return res.status(400).send(htmlPage(
+  if (!entry || entry.expiresAt <= Date.now()) {
+    return res.status(400).send(page(
       'คำขอหมดอายุ',
       'กลับไปที่ Launcher แล้วเริ่ม Login ใหม่'
     ));
   }
 
-  // ใช้ state ได้ครั้งเดียว ป้องกัน callback เดิมถูกนำกลับมาใช้ซ้ำ
+  // ใช้ state ได้ครั้งเดียว
   oauthStates.delete(state);
 
-  const session = sessions.get(stateItem.sessionId);
+  const session = sessions.get(entry.sessionId);
+
   if (!session || session.expiresAt <= Date.now()) {
-    return res.status(400).send(htmlPage(
+    return res.status(400).send(page(
       'Session หมดอายุ',
       'กลับไปที่ Launcher แล้วเริ่ม Login ใหม่'
     ));
   }
 
   if (session.status !== 'pending') {
-    return res.status(409).send(htmlPage(
+    return res.status(409).send(page(
       'คำขอนี้ถูกใช้แล้ว',
       'กลับไปตรวจสอบสถานะใน Launcher'
     ));
@@ -260,19 +276,19 @@ app.get('/auth/discord/callback', async (req, res) => {
     session.status = 'denied';
     session.completedAt = Date.now();
 
-    return res.status(400).send(htmlPage(
+    return res.status(400).send(page(
       'ยกเลิกการ Login',
-      'คุณไม่ได้อนุญาตให้เชื่อมต่อ Discord กลับไปที่ Launcher ได้'
+      'คุณไม่ได้อนุญาตการเชื่อมต่อ Discord'
     ));
   }
 
   const code = String(req.query.code || '');
+
   if (!code) {
     session.status = 'error';
-    session.errorCode = 'missing_code';
     session.completedAt = Date.now();
 
-    return res.status(400).send(htmlPage(
+    return res.status(400).send(page(
       'Login ไม่สำเร็จ',
       'ไม่พบ OAuth code กรุณาเริ่ม Login ใหม่'
     ));
@@ -280,6 +296,7 @@ app.get('/auth/discord/callback', async (req, res) => {
 
   try {
     const redirectUri = `${BASE_URL}/auth/discord/callback`;
+
     const tokenResponse = await fetch(
       'https://discord.com/api/oauth2/token',
       {
@@ -297,56 +314,64 @@ app.get('/auth/discord/callback', async (req, res) => {
       }
     );
 
+    // อ่าน response เพียงครั้งเดียว
     const rawBody = await tokenResponse.text();
 
-let tokenData = {};
-try {
-  tokenData = JSON.parse(rawBody);
-} catch {
-  tokenData = {};
-}
+    let tokenData = {};
 
-if (!tokenResponse.ok) {
-  console.error('Discord OAuth diagnostic:', {
-    status: tokenResponse.status,
-    retryAfter: tokenResponse.headers.get('retry-after'),
-    contentType: tokenResponse.headers.get('content-type'),
-    responseBody: rawBody.slice(0, 1000)
-  });
-}
+    try {
+      tokenData = JSON.parse(rawBody);
+    } catch {
+      tokenData = {};
+    }
+
+    if (!tokenResponse.ok) {
+      const retryAfter = getRetryAfterSeconds(
+        tokenResponse,
+        tokenData
+      );
+
+      console.error('Discord OAuth token exchange failed:', {
+        status: tokenResponse.status,
+        retryAfterSeconds: retryAfter,
+        scope: tokenResponse.headers.get('x-ratelimit-scope'),
+        global: tokenResponse.headers.get('x-ratelimit-global'),
+        error: tokenData.error || tokenData.message || 'unknown_error',
+        errorDescription: tokenData.error_description || null
+      });
 
       session.status = 'error';
-      session.errorCode = tokenResponse.status === 429
-        ? 'discord_rate_limited'
-        : 'discord_token_exchange_failed';
       session.completedAt = Date.now();
 
       if (tokenResponse.status === 429) {
         const waitMessage = retryAfter !== null
-          ? `Discord แจ้งให้รอประมาณ ${Math.ceil(retryAfter)} วินาที ก่อนลองใหม่ อย่ากด Login ซ้ำระหว่างนี้`
+          ? `Discord แจ้งให้รอประมาณ ${Math.ceil(retryAfter)} วินาที ก่อนลองใหม่`
           : 'Discord จำกัดคำขอชั่วคราว กรุณารอสักพักก่อนลองใหม่';
 
-        return res.status(429).send(htmlPage(
+        return res.status(429).send(page(
           'Discord จำกัดคำขอชั่วคราว',
           waitMessage
         ));
       }
 
-      return res.status(502).send(htmlPage(
-        'แลกเปลี่ยน Token ไม่สำเร็จ',
-        'Discord ปฏิเสธคำขอ กรุณาตรวจสอบ Client ID, Client Secret และ Redirect URI ใน Developer Portal กับ Render'
+      return res.status(502).send(page(
+        'Discord Login ไม่สำเร็จ',
+        'ตรวจสอบ Client ID, Client Secret และ Redirect URI ในการตั้งค่า'
       ));
     }
 
     const accessToken = tokenData.access_token;
+
     if (!accessToken) {
-      throw new Error('Discord response did not contain an access token');
+      throw new Error('Access token missing in Discord response');
     }
 
     const userResponse = await fetch(
       'https://discord.com/api/users/@me',
       {
-        headers: { Authorization: `Bearer ${accessToken}` }
+        headers: {
+          Authorization: `Bearer ${accessToken}`
+        }
       }
     );
 
@@ -354,6 +379,7 @@ if (!tokenResponse.ok) {
       console.error('Discord user lookup failed:', {
         status: userResponse.status
       });
+
       throw new Error('Discord user lookup failed');
     }
 
@@ -363,22 +389,22 @@ if (!tokenResponse.ok) {
       throw new Error('Discord user ID missing');
     }
 
-    const allowed = await isDiscordUserWhitelisted(discordUser.id);
+    const allowed = await isWhitelisted(discordUser.id);
 
     session.status = allowed ? 'approved' : 'denied';
     session.discordUserId = discordUser.id;
     session.completedAt = Date.now();
 
-    if (allowed) {
-      return res.send(htmlPage(
-        'Login สำเร็จ',
-        'ตรวจสอบ Whitelist ผ่านแล้ว กลับไปที่ Launcher ได้เลย'
+    if (!allowed) {
+      return res.status(403).send(page(
+        'ไม่มีสิทธิ์เข้าใช้งาน',
+        'ไม่พบ Discord User ID ใน Whitelist กรุณาติดต่อผู้ดูแล'
       ));
     }
 
-    return res.status(403).send(htmlPage(
-      'ไม่มีสิทธิ์เข้าใช้งาน',
-      'ไม่พบ Discord User ID ของคุณใน Whitelist กรุณาติดต่อผู้ดูแลระบบ'
+    return res.send(page(
+      'Login สำเร็จ',
+      'ตรวจสอบ Whitelist ผ่านแล้ว กลับไปที่ Launcher ได้เลย'
     ));
   } catch (error) {
     console.error('OAuth callback processing failed:', {
@@ -386,12 +412,11 @@ if (!tokenResponse.ok) {
     });
 
     session.status = 'error';
-    session.errorCode = 'callback_processing_failed';
     session.completedAt = Date.now();
 
-    return res.status(500).send(htmlPage(
+    return res.status(500).send(page(
       'เกิดข้อผิดพลาด',
-      'ระบบตรวจสอบ Login ไม่สำเร็จ กรุณาตรวจสอบ Render Logs แล้วลองใหม่ภายหลัง'
+      'ระบบตรวจสอบ Login ไม่สำเร็จ กรุณาตรวจ Render Logs'
     ));
   }
 });
@@ -400,26 +425,28 @@ app.get('/api/launcher/device-sessions/:id', (req, res) => {
   cleanExpiredData();
 
   const session = sessions.get(String(req.params.id || ''));
+
   if (!session || session.expiresAt <= Date.now()) {
     return res.status(404).json({
-      error: 'session_not_found',
-      message: 'Session ไม่พบหรือหมดอายุแล้ว'
+      error: 'session_not_found'
     });
   }
 
-  const authHeader = String(req.get('authorization') || '');
-  const match = authHeader.match(/^Bearer\s+([a-f0-9]+)$/i);
+  const authorization = String(req.get('authorization') || '');
+  const match = authorization.match(/^Bearer\s+([a-f0-9]+)$/i);
 
   if (!match) {
-    return res.status(401).json({ error: 'unauthorized' });
+    return res.status(401).json({
+      error: 'unauthorized'
+    });
   }
 
-  const providedHash = crypto.createHash('sha256')
-    .update(match[1])
-    .digest('hex');
+  const providedHash = hashSecret(match[1]);
 
   if (!safeEqualHex(providedHash, session.secretHash)) {
-    return res.status(401).json({ error: 'unauthorized' });
+    return res.status(401).json({
+      error: 'unauthorized'
+    });
   }
 
   return res.json({
@@ -433,7 +460,9 @@ app.get('/api/launcher/device-sessions/:id', (req, res) => {
 });
 
 app.use('/api', (_req, res) => {
-  res.status(404).json({ error: 'api_route_not_found' });
+  return res.status(404).json({
+    error: 'api_route_not_found'
+  });
 });
 
 app.use((err, _req, res, _next) => {
@@ -441,8 +470,13 @@ app.use((err, _req, res, _next) => {
     message: err?.message || 'unknown_error'
   });
 
-  if (res.headersSent) return;
-  res.status(500).json({ error: 'internal_server_error' });
+  if (res.headersSent) {
+    return;
+  }
+
+  return res.status(500).json({
+    error: 'internal_server_error'
+  });
 });
 
 app.listen(PORT, () => {
