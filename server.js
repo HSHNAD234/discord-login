@@ -74,14 +74,42 @@ function oauthUrl(state) {
   return url.toString();
 }
 
-// Google Sheets authentication
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, c => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[c]);
+}
+
+function page(title, message) {
+  return `<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)}</title>
+</head>
+<body style="margin:0;background:#111;color:#f5f1e9;font:16px Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh">
+<main style="max-width:560px;margin:24px;padding:32px;background:#202024;border:1px solid #d8b57a66;border-radius:16px;text-align:center">
+<h1>${escapeHtml(title)}</h1>
+<p>${message}</p>
+<p style="color:#bdb9b2">คุณสามารถปิดหน้านี้และกลับไปที่ HSHONAD Launcher ได้</p>
+</main>
+</body>
+</html>`;
+}
+
+// Google Sheets
 let serviceAccount;
 
 try {
   serviceAccount = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
 } catch {
   throw new Error(
-    'GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON. Check Render Environment.'
+    'GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON. Check Render Environment.'
   );
 }
 
@@ -95,7 +123,6 @@ const sheets = google.sheets({
   auth
 });
 
-// Check Discord ID in Google Sheets column D
 async function isWhitelisted(discordId) {
   const result = await sheets.spreadsheets.values.get({
     spreadsheetId: GOOGLE_SHEET_ID,
@@ -110,46 +137,16 @@ async function isWhitelisted(discordId) {
   );
 }
 
-// HTML helpers
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, character => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  })[character]);
-}
-
-function page(title, message) {
-  return `<!doctype html>
-<html lang="th">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>${escapeHtml(title)}</title>
-</head>
-<body style="margin:0;background:#111;color:#f5f1e9;font:16px Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh">
-  <main style="max-width:560px;margin:24px;padding:32px;background:#202024;border:1px solid #d8b57a66;border-radius:16px;text-align:center">
-    <h1>${escapeHtml(title)}</h1>
-    <p>${message}</p>
-    <p style="color:#bdb9b2">คุณสามารถปิดหน้านี้และกลับไปที่ HSHONAD Launcher ได้</p>
-  </main>
-</body>
-</html>`;
-}
-
 // Health check
 app.get('/health', (_req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true });
 });
 
-// Create a new launcher login session
+// Create login session
 app.post('/api/launcher/device-sessions', (_req, res) => {
   const now = Date.now();
 
-  // Remove expired sessions and their states
   for (const [id, session] of sessions) {
     if (session.expiresAt < now) {
       sessions.delete(id);
@@ -179,7 +176,7 @@ app.post('/api/launcher/device-sessions', (_req, res) => {
 
   res.set('Cache-Control', 'no-store');
 
-  return res.json({
+  res.json({
     device_session_id: id,
     device_secret: secret,
     verification_url: oauthUrl(state),
@@ -187,7 +184,7 @@ app.post('/api/launcher/device-sessions', (_req, res) => {
   });
 });
 
-// Discord OAuth2 callback
+// Discord OAuth callback
 app.get('/auth/discord/callback', async (req, res) => {
   const { code, state, error } = req.query;
 
@@ -195,7 +192,7 @@ app.get('/auth/discord/callback', async (req, res) => {
     return res.status(400).send(
       page(
         'ยกเลิกการเข้าสู่ระบบ',
-        'คุณยกเลิกการอนุญาต Discord แล้ว สามารถปิดหน้านี้และกลับไปที่ Launcher ได้'
+        'คุณยกเลิกการอนุญาต Discord แล้ว กลับไปที่ Launcher เพื่อเริ่มใหม่ได้'
       )
     );
   }
@@ -204,15 +201,14 @@ app.get('/auth/discord/callback', async (req, res) => {
     return res.status(400).send(
       page(
         'เข้าสู่ระบบไม่สำเร็จ',
-        'ข้อมูล OAuth2 ไม่ครบ กรุณากลับไปเริ่ม Login ใหม่ใน Launcher'
+        'ข้อมูล OAuth ไม่ครบ กรุณาเริ่ม Login ใหม่จาก Launcher'
       )
     );
   }
 
-  // OAuth state must be valid and usable only once
+  // Consume state once to prevent callback replay
   const id = states.get(state);
   const session = id ? sessions.get(id) : null;
-
   states.delete(state);
 
   if (
@@ -224,13 +220,13 @@ app.get('/auth/discord/callback', async (req, res) => {
     return res.status(400).send(
       page(
         'เซสชันหมดอายุ',
-        'กลับไปที่ Launcher แล้วเริ่ม Login ใหม่อีกครั้ง'
+        'กรุณากลับไปที่ Launcher แล้วเริ่ม Login ใหม่'
       )
     );
   }
 
   try {
-    // Exchange the authorization code for a Discord access token
+    // Exchange OAuth code once
     const tokenResponse = await fetch(
       'https://discord.com/api/oauth2/token',
       {
@@ -250,41 +246,61 @@ app.get('/auth/discord/callback', async (req, res) => {
     );
 
     if (!tokenResponse.ok) {
-      const retryAfter = tokenResponse.headers.get('retry-after');
       const errorData = await tokenResponse.json().catch(() => ({}));
+      const retryHeader = tokenResponse.headers.get('retry-after');
 
-      // Never log OAuth code, client secret, or access token
+      const retryHeaderNumber = retryHeader === null
+        ? NaN
+        : Number(retryHeader);
+
+      const bodyRetryNumber = Number(errorData.retry_after);
+
+      const retrySeconds = Number.isFinite(retryHeaderNumber)
+        ? retryHeaderNumber
+        : (
+            Number.isFinite(bodyRetryNumber) && bodyRetryNumber >= 0
+              ? bodyRetryNumber
+              : null
+          );
+
+      // Log diagnostics only; never log OAuth code or credentials
       console.error('Discord token exchange failed:', {
         status: tokenResponse.status,
-        retryAfter,
+        retryAfterSeconds: retrySeconds,
+        global: errorData.global ?? null,
         error: errorData.error || 'unknown_error',
         errorDescription:
-          errorData.error_description || 'No description'
+          errorData.error_description || errorData.message || 'No description'
       });
 
+      session.status = 'error';
+      session.completedAt = Date.now();
+
       if (tokenResponse.status === 429) {
-        session.status = 'error';
+        const waitMessage = retrySeconds !== null
+          ? `กรุณารอประมาณ ${Math.ceil(retrySeconds)} วินาที แล้วเริ่ม Login ใหม่`
+          : 'Discord ยังจำกัดคำขอ กรุณารอสักครู่แล้วเริ่ม Login ใหม่';
 
         return res.status(429).send(
-          page(
-            'Discord จำกัดการเข้าสู่ระบบชั่วคราว',
-            'มีการส่งคำขอไปยัง Discord มากเกินไป กรุณารอสักครู่แล้วกลับไปเริ่ม Login ใหม่ใน Launcher'
-          )
+          page('Discord จำกัดคำขอชั่วคราว', waitMessage)
         );
       }
 
-      throw new Error(
-        `Discord token exchange failed (${tokenResponse.status})`
+      return res.status(502).send(
+        page(
+          'เข้าสู่ระบบ Discord ไม่สำเร็จ',
+          'ไม่สามารถยืนยันกับ Discord ได้ กรุณาตรวจ Render Logs และลองใหม่ภายหลัง'
+        )
       );
     }
 
     const tokenData = await tokenResponse.json();
 
     if (!tokenData.access_token) {
-      throw new Error('Discord token response did not contain an access token');
+      throw new Error('Discord token response has no access_token');
     }
 
-    // Get the authenticated Discord user
+    // Get current Discord identity
     const userResponse = await fetch(
       'https://discord.com/api/users/@me',
       {
@@ -311,17 +327,16 @@ app.get('/auth/discord/callback', async (req, res) => {
       throw new Error('Discord did not return a valid user');
     }
 
-    // Verify the authenticated Discord ID against Google Sheets column D
+    // Check the user's Discord ID against Google Sheets column D
     let allowed;
 
     try {
       allowed = await isWhitelisted(user.id);
-    } catch (sheetError) {
-      // Log the error message only; do not log credentials
+    } catch (err) {
       console.error('Google Sheets whitelist check failed:', {
-        message: String(sheetError?.message || 'Unknown Sheets error'),
-        code: sheetError?.code || null,
-        status: sheetError?.response?.status || null
+        message: String(err?.message || 'Unknown Sheets error'),
+        status: err?.response?.status || null,
+        code: err?.code || null
       });
 
       throw new Error('Google Sheets whitelist check failed');
@@ -352,7 +367,6 @@ app.get('/auth/discord/callback', async (req, res) => {
       )
     );
   } catch (err) {
-    // Avoid logging the full request URL or OAuth credentials
     console.error('OAuth callback error:', {
       message: String(err?.message || 'Unknown OAuth error')
     });
@@ -363,13 +377,13 @@ app.get('/auth/discord/callback', async (req, res) => {
     return res.status(500).send(
       page(
         'เกิดข้อผิดพลาด',
-        'ตรวจสอบ Discord หรือ Google Sheets ไม่สำเร็จ กรุณาลองใหม่ภายหลัง'
+        'ตรวจสอบ Discord หรือ Google Sheets ไม่สำเร็จ กรุณาตรวจ Render Logs'
       )
     );
   }
 });
 
-// Launcher polls this endpoint to read the login status
+// Launcher polls login status
 app.get('/api/launcher/device-sessions/:id', (req, res) => {
   const session = findSession(req);
 
@@ -394,12 +408,10 @@ app.get('/api/launcher/device-sessions/:id', (req, res) => {
   return res.json(body);
 });
 
-// JSON 404 for unknown API routes
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'not_found' });
 });
 
-// Generic error handler
 app.use((err, _req, res, _next) => {
   console.error('Unhandled server error:', {
     message: String(err?.message || 'Unknown server error')
