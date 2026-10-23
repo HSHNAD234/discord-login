@@ -297,21 +297,23 @@ app.get('/auth/discord/callback', async (req, res) => {
       }
     );
 
-    const tokenData = await tokenResponse.json().catch(() => ({}));
+    const rawBody = await tokenResponse.text();
 
-    if (!tokenResponse.ok) {
-      const retryAfter = getRetryAfterSeconds(tokenResponse, tokenData);
-      const scope = tokenResponse.headers.get('x-ratelimit-scope');
-      const globalLimit = tokenResponse.headers.get('x-ratelimit-global');
+let tokenData = {};
+try {
+  tokenData = JSON.parse(rawBody);
+} catch {
+  tokenData = {};
+}
 
-      // ไม่บันทึก code, client secret, access token หรือ response ทั้งก้อน
-      console.error('Discord token exchange failed:', {
-        status: tokenResponse.status,
-        retryAfterSeconds: retryAfter,
-        scope,
-        global: globalLimit,
-        error: tokenData.error || tokenData.message || 'unknown_error'
-      });
+if (!tokenResponse.ok) {
+  console.error('Discord OAuth diagnostic:', {
+    status: tokenResponse.status,
+    retryAfter: tokenResponse.headers.get('retry-after'),
+    contentType: tokenResponse.headers.get('content-type'),
+    responseBody: rawBody.slice(0, 1000)
+  });
+}
 
       session.status = 'error';
       session.errorCode = tokenResponse.status === 429
