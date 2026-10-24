@@ -23,7 +23,7 @@ const sessions = new Map();
 const oauthStates = new Map();
 const pool = process.env.DATABASE_URL ? new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: /localhost|127\\.0\\.0\\.1/.test(process.env.DATABASE_URL) ? false : { rejectUnauthorized: false },
+  ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL) ? false : { rejectUnauthorized: false },
   max: 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000
@@ -148,7 +148,7 @@ async function setPersistentCooldown(seconds) {
 }
 
 function getBearerToken(req) {
-  const match = String(req.get('authorization') || '').match(/^Bearer\\s+([a-f0-9]{64})$/i);
+  const match = String(req.get('authorization') || '').match(/^Bearer\s+([a-f0-9]{64})$/i);
   return match ? match[1] : null;
 }
 
@@ -313,6 +313,15 @@ app.get('/auth/discord', (req, res) => {
 
   const state = String(req.query.state || '');
   const entry = oauthStates.get(state);
+
+  const persistedCooldown = await getPersistentCooldownSeconds().catch(() => 0);
+  if (persistedCooldown > 0) {
+    res.set('Retry-After', String(persistedCooldown));
+    return res.status(429).send(page(
+      'Discord จำกัดคำขอชั่วคราว',
+      'ระบบกำลังรอให้ Discord ยกเลิกการจำกัดคำขอ กรุณากลับไปที่ Launcher แล้วลองใหม่ภายหลัง'
+    ));
+  }
 
   if (!entry || entry.expiresAt <= Date.now()) {
     return res.status(400).send(page(
