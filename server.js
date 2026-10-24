@@ -308,7 +308,7 @@ app.post('/api/launcher/device-sessions', async (_req, res) => {
   });
 });
 
-app.get('/auth/discord', (req, res) => {
+app.get('/auth/discord', async (req, res) => {
   cleanExpiredData();
 
   const state = String(req.query.state || '');
