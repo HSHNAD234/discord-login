@@ -320,12 +320,25 @@ app.get('/auth/discord', async (req, res) => {
   const state = String(req.query.state || '');
   const entry = oauthStates.get(state);
 
-  const persistedCooldown = await getPersistentCooldownSeconds().catch(() => 0);
-  if (persistedCooldown > 0) {
-    res.set('Retry-After', String(persistedCooldown));
+  let cooldownRemaining;
+  try {
+    cooldownRemaining = Math.max(
+      await getPersistentCooldownSeconds(),
+      Math.ceil((discordOAuthRateLimitedUntil - Date.now()) / 1000)
+    );
+  } catch (error) {
+    console.error('Could not read Discord cooldown from PostgreSQL:', error.message);
+    return res.status(503).send(page(
+      'ระบบกำลังตรวจสอบสถานะ',
+      'ฐานข้อมูลยังไม่พร้อม กรุณาลองใหม่ภายหลัง'
+    ));
+  }
+
+  if (cooldownRemaining > 0) {
+    res.set('Retry-After', String(cooldownRemaining));
     return res.status(429).send(page(
       'Discord จำกัดคำขอชั่วคราว',
-      'ระบบกำลังรอให้ Discord ยกเลิกการจำกัดคำขอ กรุณากลับไปที่ Launcher แล้วลองใหม่ภายหลัง'
+      'Discord กำลังจำกัดคำขอ Login ระบบจะหยุดคำขอใหม่จนกว่าจะครบเวลาที่ Discord กำหนด'
     ));
   }
 
@@ -400,6 +413,33 @@ app.get('/auth/discord/callback', async (req, res) => {
     return res.status(400).send(page(
       'Login ไม่สำเร็จ',
       'ไม่พบ OAuth code กรุณาเริ่ม Login ใหม่'
+    ));
+  }
+
+  // Re-check the cooldown at the callback too. A user may have authorized
+  // Discord in a browser tab opened before another callback received HTTP 429.
+  // Do not send another token-exchange request while Discord's cooldown is active.
+  let cooldownRemaining;
+  try {
+    cooldownRemaining = Math.max(
+      await getPersistentCooldownSeconds(),
+      Math.ceil((discordOAuthRateLimitedUntil - Date.now()) / 1000)
+    );
+  } catch (error) {
+    console.error('Could not read Discord cooldown before token exchange:', error.message);
+    return res.status(503).send(page(
+      'ระบบกำลังตรวจสอบสถานะ',
+      'ฐานข้อมูลยังไม่พร้อม กรุณากลับไปที่ Launcher แล้วลองใหม่ภายหลัง'
+    ));
+  }
+
+  if (cooldownRemaining > 0) {
+    session.status = 'error';
+    session.completedAt = Date.now();
+    res.set('Retry-After', String(cooldownRemaining));
+    return res.status(429).send(page(
+      'Discord จำกัดคำขอชั่วคราว',
+      'Discord กำลังจำกัดคำขอ Login ระบบจะหยุดคำขอใหม่จนกว่าจะครบเวลาที่ Discord กำหนด'
     ));
   }
 
