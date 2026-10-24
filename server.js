@@ -20,6 +20,9 @@ const SESSION_TTL_MS = 10 * 60 * 1000;
 const sessions = new Map();
 const oauthStates = new Map();
 
+// Avoid creating more OAuth sessions while Discord has rate-limited the token endpoint.
+let discordOAuthRateLimitedUntil = 0;
+
 function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('hex');
 }
@@ -176,6 +179,18 @@ app.get('/health', (_req, res) => {
 
 app.post('/api/launcher/device-sessions', (_req, res) => {
   cleanExpiredData();
+
+  const cooldownRemaining = Math.ceil(
+    (discordOAuthRateLimitedUntil - Date.now()) / 1000
+  );
+
+  if (cooldownRemaining > 0) {
+    res.set('Retry-After', String(cooldownRemaining));
+    return res.status(429).json({
+      error: 'discord_rate_limited',
+      message: 'Discord is temporarily limiting login requests. The server is pausing new login attempts to avoid extending the limit.'
+    });
+  }
 
   const missing = missingConfig();
 
@@ -344,13 +359,20 @@ app.get('/auth/discord/callback', async (req, res) => {
       session.completedAt = Date.now();
 
       if (tokenResponse.status === 429) {
-        const waitMessage = retryAfter !== null
-          ? `Discord แจ้งให้รอประมาณ ${Math.ceil(retryAfter)} วินาที ก่อนลองใหม่`
-          : 'Discord จำกัดคำขอชั่วคราว กรุณารอสักพักก่อนลองใหม่';
+        // Use Discord's Retry-After only for server-side cooldown enforcement.
+        // Do not show a ticking/increasing countdown to the user.
+        const cooldownSeconds = retryAfter !== null
+          ? Math.max(1, Math.ceil(retryAfter))
+          : 60;
+
+        discordOAuthRateLimitedUntil = Math.max(
+          discordOAuthRateLimitedUntil,
+          Date.now() + cooldownSeconds * 1000
+        );
 
         return res.status(429).send(page(
           'Discord จำกัดคำขอชั่วคราว',
-          waitMessage
+          'Discord กำลังจำกัดคำขอ Login ระบบหยุดรับคำขอ Login ใหม่ชั่วคราวเพื่อป้องกันการส่งคำขอซ้ำ กรุณาลองใหม่ภายหลัง'
         ));
       }
 
