@@ -3,6 +3,7 @@ const express = require('express');
 const helmet = require('helmet');
 const crypto = require('crypto');
 const { google } = require('googleapis');
+const { Pool } = require('pg');
 
 const app = express();
 
@@ -17,8 +18,17 @@ const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const SHEET_RANGE = process.env.SHEET_RANGE || 'ชีต1!D2:D';
 
 const SESSION_TTL_MS = 10 * 60 * 1000;
+const LOGIN_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const sessions = new Map();
 const oauthStates = new Map();
+const pool = process.env.DATABASE_URL ? new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: /localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL) ? false : { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+}) : null;
+let schemaReady = false;
 
 // Avoid creating more OAuth sessions while Discord has rate-limited the token endpoint.
 let discordOAuthRateLimitedUntil = 0;
@@ -58,6 +68,7 @@ p{line-height:1.8;color:#d1d5db}
 function missingConfig() {
   const required = [
     'BASE_URL',
+    'DATABASE_URL',
     'DISCORD_CLIENT_ID',
     'DISCORD_CLIENT_SECRET',
     'GOOGLE_SHEET_ID',
@@ -81,6 +92,64 @@ function cleanExpiredData() {
       oauthStates.delete(state);
     }
   }
+}
+
+function requireDatabase(res) {
+  if (!pool || !schemaReady) {
+    res.status(503).json({ error: 'database_unavailable' });
+    return false;
+  }
+  return true;
+}
+
+async function initializeSchema() {
+  if (!pool) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS launcher_login_sessions (
+      token_hash TEXT PRIMARY KEY,
+      discord_user_id TEXT NOT NULL,
+      username TEXT,
+      avatar_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ
+    );
+    CREATE INDEX IF NOT EXISTS launcher_login_sessions_user_idx
+      ON launcher_login_sessions (discord_user_id);
+    CREATE INDEX IF NOT EXISTS launcher_login_sessions_expiry_idx
+      ON launcher_login_sessions (expires_at);
+    CREATE TABLE IF NOT EXISTS launcher_runtime_state (
+      key TEXT PRIMARY KEY,
+      value TIMESTAMPTZ NOT NULL
+    );
+  `);
+  schemaReady = true;
+}
+
+async function getPersistentCooldownSeconds() {
+  if (!pool || !schemaReady) return 0;
+  const result = await pool.query(
+    "SELECT value FROM launcher_runtime_state WHERE key = 'discord_oauth_cooldown'"
+  );
+  return result.rowCount
+    ? Math.max(0, Math.ceil((new Date(result.rows[0].value).getTime() - Date.now()) / 1000))
+    : 0;
+}
+
+async function setPersistentCooldown(seconds) {
+  if (!pool || !schemaReady) return;
+  const until = new Date(Date.now() + Math.max(1, seconds) * 1000);
+  await pool.query(`
+    INSERT INTO launcher_runtime_state (key, value)
+    VALUES ('discord_oauth_cooldown', $1)
+    ON CONFLICT (key) DO UPDATE
+    SET value = GREATEST(launcher_runtime_state.value, EXCLUDED.value)
+  `, [until]);
+}
+
+function getBearerToken(req) {
+  const match = String(req.get('authorization') || '').match(/^Bearer\s+([a-f0-9]{64})$/i);
+  return match ? match[1] : null;
 }
 
 function hashSecret(secret) {
@@ -167,21 +236,37 @@ async function isWhitelisted(discordUserId) {
   );
 }
 
-app.get('/health', (_req, res) => {
+app.get('/health', async (_req, res) => {
   const missing = missingConfig();
-
-  return res.status(missing.length ? 503 : 200).json({
-    ok: missing.length === 0,
-    service: 'hshonad-backend',
-    missing
+  let database = 'unavailable';
+  if (pool) {
+    try {
+      await pool.query('SELECT 1');
+      database = schemaReady ? 'connected' : 'initializing';
+    } catch (error) {
+      console.error('Database health check failed:', error.message);
+    }
+  }
+  const ok = missing.length === 0 && database === 'connected';
+  return res.status(ok ? 200 : 503).json({
+    ok, service: 'hshonad-backend', database, missing
   });
 });
 
-app.post('/api/launcher/device-sessions', (_req, res) => {
+app.post('/api/launcher/device-sessions', async (_req, res) => {
   cleanExpiredData();
+  if (!requireDatabase(res)) return;
 
-  const cooldownRemaining = Math.ceil(
-    (discordOAuthRateLimitedUntil - Date.now()) / 1000
+  let persistentCooldown;
+  try {
+    persistentCooldown = await getPersistentCooldownSeconds();
+  } catch (error) {
+    console.error('Could not read Discord cooldown from PostgreSQL:', error.message);
+    return res.status(503).json({ error: 'database_unavailable' });
+  }
+  const cooldownRemaining = Math.max(
+    persistentCooldown,
+    Math.ceil((discordOAuthRateLimitedUntil - Date.now()) / 1000)
   );
 
   if (cooldownRemaining > 0) {
@@ -229,11 +314,20 @@ app.post('/api/launcher/device-sessions', (_req, res) => {
   });
 });
 
-app.get('/auth/discord', (req, res) => {
+app.get('/auth/discord', async (req, res) => {
   cleanExpiredData();
 
   const state = String(req.query.state || '');
   const entry = oauthStates.get(state);
+
+  const persistedCooldown = await getPersistentCooldownSeconds().catch(() => 0);
+  if (persistedCooldown > 0) {
+    res.set('Retry-After', String(persistedCooldown));
+    return res.status(429).send(page(
+      'Discord จำกัดคำขอชั่วคราว',
+      'ระบบกำลังรอให้ Discord ยกเลิกการจำกัดคำขอ กรุณากลับไปที่ Launcher แล้วลองใหม่ภายหลัง'
+    ));
+  }
 
   if (!entry || entry.expiresAt <= Date.now()) {
     return res.status(400).send(page(
@@ -369,6 +463,9 @@ app.get('/auth/discord/callback', async (req, res) => {
           discordOAuthRateLimitedUntil,
           Date.now() + cooldownSeconds * 1000
         );
+        await setPersistentCooldown(cooldownSeconds).catch((error) => {
+          console.error('Could not persist Discord cooldown:', error.message);
+        });
 
         return res.status(429).send(page(
           'Discord จำกัดคำขอชั่วคราว',
@@ -415,6 +512,10 @@ app.get('/auth/discord/callback', async (req, res) => {
 
     session.status = allowed ? 'approved' : 'denied';
     session.discordUserId = discordUser.id;
+    session.username = String(discordUser.username || 'Discord User');
+    session.avatarUrl = discordUser.avatar
+      ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
+      : '';
     session.completedAt = Date.now();
 
     if (!allowed) {
@@ -474,11 +575,106 @@ app.get('/api/launcher/device-sessions/:id', (req, res) => {
   return res.json({
     device_session_id: session.id,
     status: session.status,
+    discord_user_id: session.discordUserId || '',
+    username: session.username || '',
+    avatar_url: session.avatarUrl || '',
     expires_in: Math.max(
       0,
       Math.floor((session.expiresAt - Date.now()) / 1000)
     )
   });
+});
+
+app.post('/api/launcher/device-sessions/:id/claim', async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const secret = getBearerToken(req);
+  if (!secret) return res.status(401).json({ error: 'unauthorized' });
+  const session = sessions.get(String(req.params.id || ''));
+  if (!session || session.expiresAt <= Date.now()) {
+    return res.status(404).json({ error: 'session_not_found' });
+  }
+  if (!safeEqualHex(hashSecret(secret), session.secretHash)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  if (session.status !== 'approved' || !session.discordUserId) {
+    return res.status(403).json({ error: 'whitelist_verification_required' });
+  }
+  try {
+    // Verify whitelist again immediately before issuing a persistent session.
+    if (!(await isWhitelisted(session.discordUserId))) {
+      session.status = 'denied';
+      return res.status(403).json({ error: 'not_whitelisted' });
+    }
+    const token = randomToken(32);
+    const expiresAt = new Date(Date.now() + LOGIN_SESSION_TTL_MS);
+    await pool.query(`
+      INSERT INTO launcher_login_sessions
+        (token_hash, discord_user_id, username, avatar_url, expires_at)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [hashSecret(token), String(session.discordUserId), session.username || 'Discord User', session.avatarUrl || '', expiresAt]);
+    return res.status(201).json({
+      session_token: token,
+      expires_at: expiresAt.toISOString(),
+      discord_user_id: String(session.discordUserId),
+      username: session.username || 'Discord User',
+      avatar_url: session.avatarUrl || '',
+      whitelist_status: 'Approved'
+    });
+  } catch (error) {
+    console.error('Could not create persistent session:', error.message);
+    return res.status(503).json({ error: 'session_storage_unavailable' });
+  }
+});
+
+app.get('/api/launcher/sessions/validate', async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const token = getBearerToken(req);
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const result = await pool.query(`
+      SELECT token_hash, discord_user_id, username, avatar_url, expires_at
+      FROM launcher_login_sessions
+      WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
+    `, [hashSecret(token)]);
+    if (!result.rowCount) return res.status(401).json({ error: 'session_invalid_or_expired' });
+    const session = result.rows[0];
+    let allowed;
+    try {
+      // Always check the live whitelist at startup; a saved token is not enough.
+      allowed = await isWhitelisted(session.discord_user_id);
+    } catch (error) {
+      console.error('Whitelist validation unavailable:', error.message);
+      return res.status(503).json({ error: 'whitelist_check_unavailable' });
+    }
+    if (!allowed) {
+      await pool.query('UPDATE launcher_login_sessions SET revoked_at = NOW() WHERE token_hash = $1', [session.token_hash]);
+      return res.status(403).json({ error: 'not_whitelisted' });
+    }
+    return res.json({
+      valid: true,
+      discord_user_id: session.discord_user_id,
+      username: session.username || 'Discord User',
+      avatar_url: session.avatar_url || '',
+      whitelist_status: 'Approved',
+      expires_at: new Date(session.expires_at).toISOString()
+    });
+  } catch (error) {
+    console.error('Session validation failed:', error.message);
+    return res.status(503).json({ error: 'session_storage_unavailable' });
+  }
+});
+
+app.post('/api/launcher/sessions/revoke', async (req, res) => {
+  if (!requireDatabase(res)) return;
+  const token = getBearerToken(req);
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    await pool.query('UPDATE launcher_login_sessions SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL', [hashSecret(token)]);
+    return res.json({ revoked: true });
+  } catch (error) {
+    console.error('Session revocation failed:', error.message);
+    return res.status(503).json({ error: 'session_storage_unavailable' });
+  }
 });
 
 app.use('/api', (_req, res) => {
@@ -501,6 +697,22 @@ app.use((err, _req, res, _next) => {
   });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Backend listening on port ${PORT}`);
+  if (!pool) {
+    console.error('DATABASE_URL is not configured; persistent session endpoints are unavailable.');
+    return;
+  }
+  try {
+    await initializeSchema();
+    console.log('PostgreSQL schema ready.');
+  } catch (error) {
+    schemaReady = false;
+    console.error('PostgreSQL initialization failed:', error.message);
+  }
+});
+
+process.on('SIGTERM', async () => {
+  if (pool) await pool.end().catch(() => {});
+  process.exit(0);
 });
