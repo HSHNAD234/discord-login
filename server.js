@@ -257,7 +257,13 @@ app.post('/api/launcher/device-sessions', async (_req, res) => {
   cleanExpiredData();
   if (!requireDatabase(res)) return;
 
-  const persistentCooldown = await getPersistentCooldownSeconds().catch(() => 0);
+  let persistentCooldown;
+  try {
+    persistentCooldown = await getPersistentCooldownSeconds();
+  } catch (error) {
+    console.error('Could not read Discord cooldown from PostgreSQL:', error.message);
+    return res.status(503).json({ error: 'database_unavailable' });
+  }
   const cooldownRemaining = Math.max(
     persistentCooldown,
     Math.ceil((discordOAuthRateLimitedUntil - Date.now()) / 1000)
